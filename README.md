@@ -5,11 +5,7 @@ Extracts iCloud Photos export `.zip` files and sorts the contents into `Photos/`
 ## Requirements
 
 - Python 3.10+
-- [`rich`](https://github.com/Textualize/rich)
-
-```bash
-pip install -r requirements.txt
-```
+- No third-party packages — stdlib only
 
 ## Usage
 

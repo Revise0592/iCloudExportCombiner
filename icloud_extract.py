@@ -3,6 +3,7 @@
 iCloud Export Combiner
 Extracts iCloud Photos export .zip files and sorts contents into Photos and Videos folders.
 Ignores .csv, .json, and other non-media files.
+No third-party dependencies — stdlib only.
 """
 
 import argparse
@@ -12,22 +13,34 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
-from rich.table import Table
-from rich import print as rprint
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
 
-console = Console()
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+CYAN   = "\033[36m"
+
+
+def c(text, *codes):
+    return "".join(codes) + str(text) + RESET
+
+
+def print_header(source_dir: Path, output_dir: Path, dry_run: bool):
+    dry = f"  {c('(DRY RUN)', YELLOW, BOLD)}" if dry_run else ""
+    print(f"\n{c('iCloud Export Combiner', BOLD, CYAN)}{dry}")
+    print(f"  Source : {c(source_dir, CYAN)}")
+    print(f"  Output : {c(output_dir, CYAN)}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Media classification
+# ---------------------------------------------------------------------------
 
 PHOTO_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".heic", ".heif",
@@ -42,11 +55,22 @@ VIDEO_EXTENSIONS = {
     ".ts", ".vob", ".mpg", ".mpeg",
 }
 
-IGNORED_EXTENSIONS = {".csv", ".json", ".txt", ".xml", ".html"}
 
+def classify_file(filename: str) -> str | None:
+    """Return 'photo', 'video', or None (skip) based on extension."""
+    ext = Path(filename).suffix.lower()
+    if ext in PHOTO_EXTENSIONS:
+        return "photo"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Zip discovery
+# ---------------------------------------------------------------------------
 
 def find_zip_files(source_dir: Path) -> list[Path]:
-    """Find and sort iCloud export zip files in the source directory."""
     pattern = re.compile(r"iCloud Photos Part (\d+) of \d+\.zip", re.IGNORECASE)
     zips = []
 
@@ -54,39 +78,28 @@ def find_zip_files(source_dir: Path) -> list[Path]:
         if f.suffix.lower() == ".zip":
             match = pattern.match(f.name)
             if match:
-                part_num = int(match.group(1))
-                zips.append((part_num, f))
+                zips.append((int(match.group(1)), f))
 
     if not zips:
-        # Fallback: grab all zips sorted naturally
         all_zips = sorted(source_dir.glob("*.zip"))
         if all_zips:
-            console.print(
-                "[yellow]Warning:[/yellow] No files matched the iCloud naming pattern. "
-                "Processing all .zip files in alphabetical order."
+            print(
+                c("Warning:", YELLOW, BOLD)
+                + " No files matched the iCloud naming pattern. "
+                "Processing all .zip files alphabetically."
             )
             return all_zips
+        return []
 
     zips.sort(key=lambda x: x[0])
     return [f for _, f in zips]
 
 
-def classify_file(filename: str) -> str | None:
-    """Return 'photo', 'video', or None (to skip) based on file extension."""
-    ext = Path(filename).suffix.lower()
-    if ext in PHOTO_EXTENSIONS:
-        return "photo"
-    if ext in VIDEO_EXTENSIONS:
-        return "video"
-    return None  # skip
+# ---------------------------------------------------------------------------
+# Extraction + sorting
+# ---------------------------------------------------------------------------
 
-
-def extract_and_sort(
-    zip_files: list[Path],
-    output_dir: Path,
-    dry_run: bool = False,
-) -> dict:
-    """Extract zip files and sort media into Photos/Videos directories."""
+def extract_and_sort(zip_files: list[Path], output_dir: Path, dry_run: bool) -> dict:
     photos_dir = output_dir / "Photos"
     videos_dir = output_dir / "Videos"
 
@@ -104,125 +117,106 @@ def extract_and_sort(
         "zips_processed": 0,
     }
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        expand=True,
-    )
+    total_zips = len(zip_files)
+    pad = len(str(total_zips))
 
-    with progress:
-        zip_task = progress.add_task("Processing zip files", total=len(zip_files))
+    for idx, zip_path in enumerate(zip_files, 1):
+        z_photos = z_videos = z_skipped = z_errors = 0
 
-        for zip_path in zip_files:
-            progress.update(zip_task, description=f"[bold blue]{zip_path.name}")
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
+                    filename = Path(member.filename).name
+                    kind = classify_file(filename)
 
-            try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    members = [m for m in zf.infolist() if not m.is_dir()]
-                    file_task = progress.add_task(
-                        f"  Extracting", total=len(members), visible=True
-                    )
+                    if kind is None:
+                        z_skipped += 1
+                        ext = Path(filename).suffix.lower() or "(no extension)"
+                        stats["skipped_extensions"][ext] += 1
+                        continue
 
-                    for member in members:
-                        filename = Path(member.filename).name
-                        progress.update(file_task, description=f"  [dim]{filename[:50]}")
+                    dest_dir = photos_dir if kind == "photo" else videos_dir
+                    dest_path = dest_dir / filename
 
-                        kind = classify_file(filename)
+                    if dest_path.exists():
+                        stem, suffix = dest_path.stem, dest_path.suffix
+                        counter = 1
+                        while dest_path.exists():
+                            dest_path = dest_dir / f"{stem}_{counter}{suffix}"
+                            counter += 1
+                        stats["duplicates"] += 1
 
-                        if kind is None:
-                            stats["skipped"] += 1
-                            ext = Path(filename).suffix.lower() or "(no extension)"
-                            stats["skipped_extensions"][ext] += 1
-                            progress.advance(file_task)
+                    if not dry_run:
+                        try:
+                            dest_path.write_bytes(zf.read(member.filename))
+                        except Exception as e:
+                            print(f"  {c('Error', RED, BOLD)} extracting {filename}: {e}")
+                            z_errors += 1
                             continue
 
-                        dest_dir = photos_dir if kind == "photo" else videos_dir
-                        dest_path = dest_dir / filename
+                    if kind == "photo":
+                        z_photos += 1
+                    else:
+                        z_videos += 1
 
-                        # Handle duplicates by appending a counter
-                        if dest_path.exists():
-                            stem = dest_path.stem
-                            suffix = dest_path.suffix
-                            counter = 1
-                            while dest_path.exists():
-                                dest_path = dest_dir / f"{stem}_{counter}{suffix}"
-                                counter += 1
-                            stats["duplicates"] += 1
-
-                        if not dry_run:
-                            try:
-                                data = zf.read(member.filename)
-                                dest_path.write_bytes(data)
-                            except Exception as e:
-                                console.print(
-                                    f"[red]Error extracting {filename}:[/red] {e}"
-                                )
-                                stats["errors"] += 1
-                                progress.advance(file_task)
-                                continue
-
-                        if kind == "photo":
-                            stats["photos"] += 1
-                        else:
-                            stats["videos"] += 1
-
-                        progress.advance(file_task)
-
-                    progress.remove_task(file_task)
-
-            except zipfile.BadZipFile:
-                console.print(f"[red]Bad zip file:[/red] {zip_path.name}")
-                stats["errors"] += 1
-            except Exception as e:
-                console.print(f"[red]Error processing {zip_path.name}:[/red] {e}")
-                stats["errors"] += 1
-
+        except zipfile.BadZipFile:
+            print(f"[{idx:{pad}}/{total_zips}] {zip_path.name}  {c('bad zip — skipped', RED)}")
+            stats["errors"] += 1
             stats["zips_processed"] += 1
-            progress.advance(zip_task)
+            continue
+        except Exception as e:
+            print(f"[{idx:{pad}}/{total_zips}] {zip_path.name}  {c(e, RED)}")
+            stats["errors"] += 1
+            stats["zips_processed"] += 1
+            continue
+
+        stats["photos"] += z_photos
+        stats["videos"] += z_videos
+        stats["skipped"] += z_skipped
+        stats["errors"] += z_errors
+        stats["zips_processed"] += 1
+
+        parts = [c(f"{z_photos} photos", GREEN), c(f"{z_videos} videos", CYAN)]
+        if z_skipped:
+            parts.append(c(f"{z_skipped} skipped", DIM))
+        if z_errors:
+            parts.append(c(f"{z_errors} errors", RED))
+        print(f"[{idx:{pad}}/{total_zips}] {zip_path.name}  {', '.join(parts)}")
 
     return stats
 
 
-def print_summary(zip_files: list[Path], stats: dict, output_dir: Path, dry_run: bool):
-    table = Table(title="Summary", show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="bold cyan", justify="right")
-    table.add_column()
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 
-    table.add_row("Zip files processed:", str(stats["zips_processed"]))
-    table.add_row("Photos extracted:", f"[green]{stats['photos']}[/green]")
-    table.add_row("Videos extracted:", f"[green]{stats['videos']}[/green]")
-    table.add_row("Files skipped (non-media):", str(stats["skipped"]))
-    table.add_row("Duplicate renames:", str(stats["duplicates"]))
+def print_summary(stats: dict, output_dir: Path, dry_run: bool):
+    prefix = c("DRY RUN  ", YELLOW, BOLD) if dry_run else ""
+    print(f"\n{prefix}{c('Results', BOLD)}")
+    print(f"  {'Zip files processed':<28} {stats['zips_processed']}")
+    print(f"  {'Photos extracted':<28} {c(stats['photos'], GREEN, BOLD)}")
+    print(f"  {'Videos extracted':<28} {c(stats['videos'], GREEN, BOLD)}")
+    print(f"  {'Files skipped (non-media)':<28} {stats['skipped']}")
+    print(f"  {'Duplicate renames':<28} {stats['duplicates']}")
     if stats["errors"]:
-        table.add_row("Errors:", f"[red]{stats['errors']}[/red]")
-
+        print(f"  {'Errors':<28} {c(stats['errors'], RED, BOLD)}")
     if not dry_run:
-        table.add_row("Output — Photos:", str(output_dir / "Photos"))
-        table.add_row("Output — Videos:", str(output_dir / "Videos"))
-
-    prefix = "[yellow]DRY RUN — [/yellow]" if dry_run else ""
-    console.print(Panel(table, title=f"{prefix}Extraction Complete", border_style="green"))
+        print(f"  {'Output — Photos':<28} {c(output_dir / 'Photos', CYAN)}")
+        print(f"  {'Output — Videos':<28} {c(output_dir / 'Videos', CYAN)}")
 
     if stats["skipped_extensions"]:
-        skip_table = Table(
-            title="Skipped file types",
-            show_header=True,
-            header_style="bold dim",
-            box=None,
-            padding=(0, 2),
-        )
-        skip_table.add_column("Extension", style="dim")
-        skip_table.add_column("Count", justify="right", style="dim")
+        print(f"\n{c('Skipped file types', BOLD)}")
         for ext, count in stats["skipped_extensions"].most_common():
-            skip_table.add_row(ext, str(count))
-        console.print(skip_table)
+            print(f"  {ext:<20} {c(count, DIM)}")
 
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -250,29 +244,20 @@ def main():
     output_dir = Path(args.output).resolve() if args.output else source_dir
 
     if not source_dir.is_dir():
-        console.print(f"[red]Error:[/red] Source directory not found: {source_dir}")
+        print(f"{c('Error:', RED, BOLD)} Source directory not found: {source_dir}")
         sys.exit(1)
 
-    console.print(
-        Panel.fit(
-            "[bold]iCloud Export Combiner[/bold]\n"
-            f"Source: [cyan]{source_dir}[/cyan]\n"
-            f"Output: [cyan]{output_dir}[/cyan]"
-            + ("[yellow]  (DRY RUN)[/yellow]" if args.dry_run else ""),
-            border_style="blue",
-        )
-    )
+    print_header(source_dir, output_dir, args.dry_run)
 
     zip_files = find_zip_files(source_dir)
-
     if not zip_files:
-        console.print("[red]No iCloud export zip files found in the source directory.[/red]")
+        print(f"{c('Error:', RED, BOLD)} No iCloud export zip files found in the source directory.")
         sys.exit(1)
 
-    console.print(f"Found [bold]{len(zip_files)}[/bold] zip file(s) to process.\n")
+    print(f"Found {c(len(zip_files), BOLD)} zip file(s) to process.\n")
 
     stats = extract_and_sort(zip_files, output_dir, dry_run=args.dry_run)
-    print_summary(zip_files, stats, output_dir, dry_run=args.dry_run)
+    print_summary(stats, output_dir, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
